@@ -1,0 +1,61 @@
+import chromadb
+from sentence_transformers import SentenceTransformer
+import anthropic
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+def chunk_text(text, chunk_size=200, overlap=50):
+    words = text.split()
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = start + chunk_size
+        chunks.append(" ".join(words[start:end]))
+        start += chunk_size - overlap
+    return chunks
+
+client = chromadb.Client()
+collection = client.create_collection(name="my_docs")
+
+doc_id = 0
+for filename in ["doc1.txt", "doc2.txt", "doc3.txt"]:
+    with open(filename, "r", encoding="utf-8") as f:
+        text = f.read()
+    for chunk in chunk_text(text):
+        embedding = model.encode(chunk).tolist()
+        collection.add(
+            ids=[str(doc_id)],
+            embeddings=[embedding],
+            documents=[chunk],
+            metadatas=[{"source": filename}]
+        )
+        doc_id += 1
+
+question = "What is the Great Red Spot?"
+question_embedding = model.encode(question).tolist()
+
+results = collection.query(query_embeddings=[question_embedding], n_results=1)
+top_chunk = results["documents"][0][0]
+top_source = results["metadatas"][0][0]["source"]
+
+claude = anthropic.Anthropic(
+    api_key="YOUR_ANTHROPIC_KEY",
+    default_headers={"anthropic-workspace-id": "wsp_YOUR_WORKSPACE_ID"}
+)
+
+prompt = f"""Answer the question using only the context below.
+
+Context:
+{top_chunk}
+
+Question: {question}
+"""
+
+response = claude.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=200,
+    messages=[{"role": "user", "content": prompt}]
+)
+
+print("Retrieved from:", top_source)
+print("\nAnswer:\n", response.content[0].text)
