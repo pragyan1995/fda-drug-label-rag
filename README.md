@@ -10,6 +10,7 @@ A retrieval-augmented generation (RAG) pipeline built from first principles — 
 4. Embeds each chunk using a local sentence-transformer model (`all-MiniLM-L6-v2`).
 5. Indexes the embeddings in a FAISS vector index for fast similarity search.
 6. Given a question, embeds it, retrieves the most relevant chunk(s) via cosine similarity, and passes the top chunk as grounded context to Claude (Anthropic API) to generate the final answer.
+7. Scores each generated answer for groundedness using an automated G-Eval metric, judged by Claude itself — no manual eyeballing required.
 
 ## Why these choices
 
@@ -18,11 +19,12 @@ A retrieval-augmented generation (RAG) pipeline built from first principles — 
 - **Overlapping chunks.** Within a section, a configurable overlap (default 50 words per 200-word chunk) prevents a relevant idea from being split awkwardly across two chunks.
 - **FAISS over ChromaDB.** ChromaDB requires a newer sqlite3 than ships with some Python/Anaconda environments, and getting it working reliably on Windows was a real environment fight with no conceptual payoff. FAISS has no such dependency, installs as a clean compiled wheel, and is a standard, production-used vector index.
 - **Explicit grounding instruction in the prompt** ("answer using only the context below") to reduce the model answering from general training knowledge instead of the retrieved document — a core RAG correctness concern.
+- **Claude-as-judge for evaluation, not a second provider.** DeepEval's default G-Eval judge is OpenAI-based. Rather than adding a second paid API dependency, I wrote a custom DeepEvalBaseLLM wrapper so Claude judges its own pipeline's output — one provider, no extra account, and a concrete demonstration that the judge model isn't locked to a single vendor.
 - **API key handled via `.env`**, never hardcoded, and excluded from version control via `.gitignore`.
 
 ## Evidence the structure-aware chunking matters
 
-Query: *"What should I do if I experience stomach bleeding symptoms?"*
+Query: "What should I do if I experience stomach bleeding symptoms?"
 
 Top 3 retrieved chunks, ranked by cosine similarity:
 
@@ -34,11 +36,23 @@ Top 3 retrieved chunks, ranked by cosine similarity:
 
 All three top matches came from the clinically correct sections — the ones that actually discuss stomach bleeding symptoms and next steps — not from unrelated sections like "Storage and Handling" or "Inactive Ingredients" that happen to share incidental vocabulary. This is the direct payoff of parsing real section boundaries instead of chunking by raw word count: retrieval stays anchored to the right part of the document.
 
-Generated answer (grounded in the top-ranked "OTC - STOP USE SECTION" chunk):
+## Automated groundedness evaluation
 
-> Based on the context, if you experience any of the following signs of stomach bleeding, you should seek attention: feel faint, have bloody or black stools, vomit blood, have stomach pain that does not get better. These are listed as warning signs that require immediate medical attention.
+Manual spot-checking first caught a grounding issue (an answer that softened the source's urgency language), but eyeballing outputs doesn't scale and isn't reproducible. To catch this systematically, I added an automated G-Eval groundedness metric (via DeepEval) that scores whether each generated answer is fully supported by its retrieved context — using Claude itself as the judge model, via a custom DeepEvalBaseLLM wrapper, so the whole pipeline runs on one provider with no second API dependency.
 
-**Known limitation:** the retrieved source text says to "seek medical help right away" for an allergic reaction and lists stomach-bleeding signs as needing attention, but the generated answer softens this to "should seek attention" rather than preserving the more urgent original phrasing. This is a real grounding-fidelity gap — the model paraphrased rather than exactly preserving the actionable instruction. It's exactly the kind of drift an automated groundedness eval (e.g. G-Eval-style LLM-as-judge, checking whether the answer's claims are fully supported by the retrieved context) would catch systematically rather than relying on manual inspection. Not yet implemented — see below.
+Metric definition: the judge checks whether the answer omits, softens, or alters severity/urgency language present in the retrieved context — the exact failure mode observed manually.
+
+### Results on 3 real DailyMed questions
+
+| Question | Score | Finding |
+|---|---|---|
+| What should I do if I experience stomach bleeding symptoms? | 0.60 ⚠️ | Below threshold (0.7). The judge caught two concrete issues: the answer omitted several warning signs present in the source (heart/stroke symptoms, fever duration, new symptoms), and added the phrase "immediate medical attention," which wasn't literally present in the retrieved text. |
+| What is the maximum dosage of ibuprofen per day? | 0.90 | Correctly reflected that the source doesn't state an exact human dose, without inventing one. |
+| Can I take this medication while pregnant? | 0.90 | Correctly preserved "not known" and "talk with your healthcare provider" without adding false certainty. |
+
+Why this matters: the first result is a genuine, reproducible failure caught by the eval, not by manual reading — and it's exactly the class of error that matters most in a healthcare context: an answer that quietly drops safety-relevant information while still sounding complete and confident. A groundedness score below threshold is a concrete, automatable signal that a response needs review before being shown to a user — this is the mechanism that would gate a real deployment, not a one-off observation.
+
+Limitations of this eval setup: three questions is a smoke test, not a real evaluation suite — a production version would run this against dozens of question/answer pairs, track score trends over time, and gate deployment on a minimum pass rate rather than reporting scores after the fact.
 
 ## Setup
 
@@ -71,14 +85,19 @@ Run the full retrieval + generation pipeline:
 python Step_8.py
 ```
 
+Run the automated groundedness evaluation:
+```bash
+python step_9.py
+```
+
 ## What I'd add next
 
-- **Automated groundedness evaluation** (e.g. G-Eval / LLM-as-judge) to systematically catch cases like the softened phrasing above, instead of manual spot-checking.
-- **Hybrid search** (BM25 + embedding similarity) to catch exact-term matches (drug names, dosage numbers) that pure semantic search can miss.
-- **Reranking** with a cross-encoder over the top-k candidates for higher precision.
-- **Retrieval evaluation** (recall@k) across a labeled set of question/section pairs.
-- **Section-filtered retrieval** — letting a query restrict search to a specific section type (e.g. only search "Dosage & Administration" for dosing questions).
+- Expand the eval suite beyond a 3-question smoke test — dozens of labeled question/answer pairs, tracked over time, gating deployment on a minimum pass rate.
+- Hybrid search (BM25 + embedding similarity) to catch exact-term matches (drug names, dosage numbers) that pure semantic search can miss.
+- Reranking with a cross-encoder over the top-k candidates for higher precision.
+- Retrieval evaluation (recall@k) across a labeled set of question/section pairs.
+- Section-filtered retrieval — letting a query restrict search to a specific section type (e.g. only search "Dosage & Administration" for dosing questions).
 
 ## Stack
 
-Python · sentence-transformers · FAISS · Anthropic API · DailyMed SPL/XML (FDA structured product labeling)
+Python · sentence-transformers · FAISS · Anthropic API (generation + Claude-as-judge eval) · DeepEval (G-Eval) · DailyMed SPL/XML (FDA structured product labeling)
